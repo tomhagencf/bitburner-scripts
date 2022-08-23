@@ -164,7 +164,7 @@ export async function getNsDataThroughFile_Custom(ns, fnRun, fnIsAlive, command,
         `const f="${fName}"; if(ns.read(f)!==r) await ns.write(f,r,'w')`;
     // Run the command with auto-retries if it fails
     const pid = await runCommand_Custom(ns, fnRun, commandToFile, fNameCommand, args, verbose, maxRetries, retryDelayMs);
-    // Wait for the process to complete
+    // Wait for the process to complete (TODO: Replace the need for a `fnIsAlive` with one that simply checks the file contents are no longer `initialContents`)
     await waitForProcessToComplete_Custom(ns, fnIsAlive, pid, verbose);
     if (verbose) ns.print(`Process ${pid} is done. Reading the contents of ${fName}...`);
     // Read the file, with auto-retries if it fails // TODO: Unsure reading a file can fail or needs retrying. 
@@ -270,7 +270,7 @@ export async function waitForProcessToComplete(ns, pid, verbose) {
  * An advanced version of waitForProcessToComplete that lets you pass your own "isAlive" test to reduce RAM requirements (e.g. to avoid referencing ns.isRunning)
  * Importing incurs 0 GB RAM (assuming fnIsAlive is implemented using another ns function you already reference elsewhere like ns.ps) 
  * @param {NS} ns - The nestcript instance passed to your script's main entry point
- * @param {function} fnIsAlive - A single-argument function used to start the new sript, e.g. `ns.isRunning` or `pid => ns.ps("home").some(process => process.pid === pid)`
+ * @param {(pid: number) => Promise<boolean>} fnIsAlive - A single-argument function used to start the new sript, e.g. `ns.isRunning` or `pid => ns.ps("home").some(process => process.pid === pid)`
  **/
 export async function waitForProcessToComplete_Custom(ns, fnIsAlive, pid, verbose) {
     checkNsInstance(ns, '"waitForProcessToComplete_Custom"');
@@ -278,18 +278,27 @@ export async function waitForProcessToComplete_Custom(ns, fnIsAlive, pid, verbos
     // Wait for the PID to stop running (cheaper than e.g. deleting (rm) a possibly pre-existing file and waiting for it to be recreated)
     let start = Date.now();
     let sleepMs = 1;
+    let done = false;
     for (var retries = 0; retries < 1000; retries++) {
-        if (!fnIsAlive(pid)) break; // Script is done running
+        if (!(await fnIsAlive(pid))) {
+            done = true;
+            break; // Script is done running
+        }
         if (verbose && retries % 100 === 0) ns.print(`Waiting for pid ${pid} to complete... (${formatDuration(Date.now() - start)})`);
         await ns.sleep(sleepMs);
         sleepMs = Math.min(sleepMs * 2, 200);
     }
     // Make sure that the process has shut down and we haven't just stopped retrying
-    if (fnIsAlive(pid)) {
+    if (!done) {
         let errorMessage = `run-command pid ${pid} is running much longer than expected. Max retries exceeded.`;
         ns.print(errorMessage);
         throw new Error(errorMessage);
     }
+}
+
+/** If the argument is an Error instance, returns it as is, otherwise, returns a new Error instance. */
+function asError(error) {
+    return error instanceof Error ? error : new Error(typeof error === 'string' ? error : JSON.stringify(error));
 }
 
 /** Helper to retry something that failed temporarily (can happen when e.g. we temporarily don't have enough RAM to run)
@@ -303,15 +312,15 @@ export async function autoRetry(ns, fnFunctionThatMayFail, fnSuccessCondition, e
             const result = await fnFunctionThatMayFail()
             const error = typeof errorContext === 'string' ? errorContext : errorContext();
             if (!fnSuccessCondition(result))
-                throw (typeof error === 'string' ? new Error(error) : error);
+                throw asError(error);
             return result;
         }
         catch (error) {
             const fatal = attempts >= maxRetries;
             log(ns, `${fatal ? 'FAIL' : 'INFO'}: Attempt ${attempts} of ${maxRetries} failed` +
-                (fatal ? `: ${String(error)}` : `. Trying again in ${retryDelayMs}ms...`),
+                (fatal ? `: ${typeof error === 'string' ? error : error.message || JSON.stringify(error)}` : `. Trying again in ${retryDelayMs}ms...`),
                 tprintFatalErrors && fatal, !verbose ? undefined : (fatal ? 'error' : 'info'))
-            if (fatal) throw error;
+            if (fatal) throw asError(error);
             await ns.sleep(retryDelayMs);
             retryDelayMs *= backoffRate;
         }
@@ -357,6 +366,7 @@ export async function getActiveSourceFiles(ns, includeLevelsFromCurrentBitnode =
 }
 
 /** @param {NS} ns 
+ * @param {(ns: NS, command: string, fName?: string, args?: any, verbose?: any, maxRetries?: number, retryDelayMs?: number) => Promise<any>} fnGetNsDataThroughFile
  * getActiveSourceFiles Helper that allows the user to pass in their chosen implementation of getNsDataThroughFile to minimize RAM usage **/
 export async function getActiveSourceFiles_Custom(ns, fnGetNsDataThroughFile, includeLevelsFromCurrentBitnode = true) {
     checkNsInstance(ns, '"getActiveSourceFiles"');
@@ -411,19 +421,23 @@ export async function instanceCount(ns, onHost = "home", warn = true, tailOtherI
     return others.length;
 }
 
-let cachedStockSymbols; // Cache of stock symbols since these never change
+let cachedStockSymbols = null; // Cache of stock symbols since these never change
+
+/** Helper function to get all stock symbols, or null if you do not have TIX api access.
+ * Caches symbols the first time they are successfully requested, since symbols never change.
+ * @param {NS} ns */
+export async function getStockSymbols(ns) {
+    cachedStockSymbols ??= await getNsDataThroughFile(ns,
+        `(() => { try { return ns.stock.getSymbols(); } catch { return null; } })()`,
+        '/Temp/stock-symbols.txt');
+    return cachedStockSymbols;
+}
 
 /** Helper function to get the total value of stocks using as little RAM as possible.
- * @param {NS} ns
- * @param {Player} player - If you have previously retrieved player info, you can provide that here to save some time.
- * @param {string[]} stockSymbols - If you have previously retrieved a list of all stock symbols, you can provide that here to save some time. */
-export async function getStocksValue(ns, player = null, stockSymbols = null) {
-    if (!(player || await getNsDataThroughFile(ns, 'ns.stock.hasTIXAPIAccess()', '/Temp/hasTIX.txt'))) return 0;
-    if (!stockSymbols || stockSymbols.length == 0) {
-        if (!cachedStockSymbols)
-            cachedStockSymbols = await getNsDataThroughFile(ns, `ns.stock.getSymbols()`, '/Temp/stock-symbols.txt');
-        stockSymbols = cachedStockSymbols;
-    }
+ * @param {NS} ns */
+export async function getStocksValue(ns) {
+    let stockSymbols = await getStockSymbols(ns);
+    if (stockSymbols == null) return 0; // No TIX API Access
     const helper = async (fn) => await getNsDataThroughFile(ns,
         `Object.fromEntries(ns.args.map(sym => [sym, ns.stock.${fn}(sym)]))`, `/Temp/stock-${fn}.txt`, stockSymbols);
     const askPrices = await helper('getAskPrice');
